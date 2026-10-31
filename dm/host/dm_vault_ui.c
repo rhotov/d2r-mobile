@@ -39,6 +39,9 @@ static int g_drop_id;   // 拖进编年史页、等放回原格后存入的那�
 static char g_query[64]; static int g_page_q;
 static int g_tip_on;   // 说明框开着时 = 哪一格 + 1   // 搜索字（空 = 按部位看）、搜索结果翻到第几页 | While the tooltip is open = which cell + 1   // search text (empty = browse by slot), which page of the search results
 static int g_cell_row[VPER], g_set_row[VSET_ROWS][VSET_N];   // 屏上每一格对应 vt_rows 的哪一行（−1 = 空），画的时候记，点按时查 | Which vt_rows row each on-screen cell corresponds to (−1 = empty); recorded when drawing, looked up on tap
+// 缓存按显示槽位复用，不能积累已销毁的控件地址：开箱 / 切换操作模式会重建控件，旧地址填满缓存后套装件就不再换图。
+// Reuse one cache entry per display slot. Keeping destroyed widget addresses fills the cache after UI rebuilds and prevents set icons from loading.
+static struct { uint64_t w; const char *icon; } g_icons[VPER + VSET_ROWS * VSET_N];
 
 static uint8_t *vu_base(void) { static uint8_t *b; if (!b) for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base; return b; }
 static uint64_t vu_find(uint64_t w, const char *name, int dep) {   // 按名字找控件：名字 +8、子控件数组 +0x58、个数 +0x60（同 dm_kills.c） | Find a widget by name: name +8, child array +0x58, count +0x60 (same as dm_kills.c)
@@ -123,14 +126,16 @@ static int vu_state(uint8_t *b, const vt_row *r) { static int tn = -1; if (tn < 
     return dm_vault_has(r->kind, r->row) ? ST_STORED : vu_seen(b, r->kind, r->row) ? ST_SEEN : ST_NONE; }
 // 一格的图：底图帧（状态）+ 物品图（换图后按图的大小缩进格子框里、居中）+ 透明度
 // One cell's images: background frame (state) + item image (after the image swap, scaled to fit inside the cell frame by the image size and centered) + transparency
-static void vu_tile(uint8_t *b, uint64_t cell, const char *tile, const vt_row *r, int st) {
+static void vu_tile(uint8_t *b, uint64_t cell, const char *tile, const vt_row *r, int st, int slot) {
     char nm[24]; uint64_t t = vu_find(cell, tile, 0); snprintf(nm, sizeof nm, "%sBox", tile); uint64_t box = vu_find(cell, nm, 0); snprintf(nm, sizeof nm, "%sImg", tile); uint64_t im = vu_find(cell, nm, 0);
     if (!t || !box || !im) return;
     uint64_t cg = vu_find(cell, "CellGold", 0); snprintf(nm, sizeof nm, "%sGold", tile); vu_show(vu_find(cell, nm, 0), st == ST_STORED && !cg); vu_show(cg, st == ST_STORED);   // 暗金格：整格金框（只一个框）；套装件格：那一件自己的框   // 存着 = 金框（暗金页整格、套装页那一件） | Unique cell: gold frame around the whole cell (one frame only); set item cell: that piece's own frame   // stored = gold frame (whole cell on the unique page, that piece on the set page)
-    static struct { uint64_t w; const char *icon; } cache[VPER + VSET_ROWS * VSET_N]; int ci = -1, fr = -1;
-    for (int i = 0; i < (int)(sizeof cache / sizeof cache[0]); i++) { if (cache[i].w == im) { ci = i; break; } if (fr < 0 && !cache[i].w) fr = i; }
-    if (ci < 0 && fr >= 0) { ci = fr; cache[ci].w = im; cache[ci].icon = NULL; }
-    if (ci >= 0 && cache[ci].icon != r->icon) { cache[ci].icon = r->icon; vu_image(b, im, r->icon); *(int32_t *)(im + 0x70) = 0; *(int32_t *)(im + 0x74) = 0; *(float *)(im + 0x80) = 1.0f; }
+    if (slot < 0 || slot >= (int)(sizeof g_icons / sizeof g_icons[0])) return;
+    // 同地址也可能是新控件；尺寸为零时重试，避免空图或尚未加载成功的图被当作缓存命中。
+    // A new widget can reuse the same address. Retry an empty image instead of treating it as a cache hit.
+    if (g_icons[slot].w != im || g_icons[slot].icon != r->icon || *(int32_t *)(im + 0x78) <= 0 || *(int32_t *)(im + 0x7c) <= 0) {
+        vu_image(b, im, r->icon); g_icons[slot].w = im; g_icons[slot].icon = r->icon;
+        *(int32_t *)(im + 0x70) = 0; *(int32_t *)(im + 0x74) = 0; *(float *)(im + 0x80) = 1.0f; }
     int bw = *(int32_t *)(box + 0x78), bh = *(int32_t *)(box + 0x7c), iw = *(int32_t *)(im + 0x78), ih = *(int32_t *)(im + 0x7c);
     if (iw > 0 && ih > 0 && bw > 0 && bh > 0) { float s = (float)bw / iw < (float)bh / ih ? (float)bw / iw : (float)bh / ih; if (s > 1.0f) s = 1.0f;
         *(float *)(im + 0x80) = s; vu_move(im, (int)((bw - iw * s) / 2), (int)((bh - ih * s) / 2)); }
@@ -144,7 +149,7 @@ static void vu_uniques(uint8_t *b, uint64_t vt) {
     uint64_t u = vu_find(vt, "TouchV_Uniq", 0);
     for (int k = 0; k < VPER; k++) { char nm[16]; snprintf(nm, sizeof nm, "TouchV_U%d", k); uint64_t c = vu_find(u, nm, 0); if (!c) continue;
         int j = *pg * VPER + k; g_cell_row[k] = j < n ? list[j] : -1; if (j >= n) { vu_show(c, 0); continue; } vu_show(c, 1);
-        const vt_row *r = &vt_rows[list[j]]; int st = vu_state(b, r); vu_tile(b, c, "Tile", r, st);
+        const vt_row *r = &vt_rows[list[j]]; int st = vu_state(b, r); vu_tile(b, c, "Tile", r, st, k);
         uint64_t nw = vu_find(c, "Name", 0), dm = vu_find(c, "Sub", 0);   // 字色照：存着 金 / 收录过 暗金 + 蓝字 / 没遇到过 灰 | Text color follows: stored gold / recorded dark gold + blue text / never encountered gray
         if (st == ST_STORED) { vu_color(b, nw, 199, 179, 119); vu_color(b, dm, 232, 210, 150); } else if (st == ST_SEEN) { vu_color(b, nw, 170, 160, 130); vu_color(b, dm, 150, 190, 255); } else { vu_color(b, nw, 110, 108, 100); vu_color(b, dm, 120, 118, 110); }
         vu_text(b, nw, vu_name(b, r->key)); vu_text(b, dm, st == ST_STORED ? dm_str(b, "dmVaultStored") : st == ST_SEEN ? dm_str(b, "dmVaultSeen") : dm_str(b, "dmVaultNone"));
@@ -160,7 +165,7 @@ static void vu_sets(uint8_t *b, uint64_t vt) {
         int s = *pg * VSET_ROWS + r; for (int j = 0; j < VSET_N; j++) g_set_row[r][j] = -1; if (s >= VT_NSET) { vu_show(row, 0); continue; } vu_show(row, 1);
         int k = 0, have = 0;
         for (int i = 0; i < VT_NROW && k < VSET_N; i++) { const vt_row *e = &vt_rows[i]; if (e->kind != 0 || e->set != s) continue; int st = vu_state(b, e); have += st == ST_STORED;
-            g_set_row[r][k] = i; char tn[16]; snprintf(tn, sizeof tn, "Tile%dDot", k); vu_text(b, vu_find(row, tn, 0), st == ST_SEEN ? "●" : ""); snprintf(tn, sizeof tn, "Tile%d", k); vu_show(vu_find(row, tn, 0), 1); snprintf(nm, sizeof nm, "Tile%dBox", k); vu_show(vu_find(row, nm, 0), 1); vu_tile(b, row, tn, e, st); k++; }
+            g_set_row[r][k] = i; char tn[16]; snprintf(tn, sizeof tn, "Tile%dDot", k); vu_text(b, vu_find(row, tn, 0), st == ST_SEEN ? "●" : ""); snprintf(tn, sizeof tn, "Tile%d", k); vu_show(vu_find(row, tn, 0), 1); snprintf(nm, sizeof nm, "Tile%dBox", k); vu_show(vu_find(row, nm, 0), 1); vu_tile(b, row, tn, e, st, VPER + r * VSET_N + k); k++; }
         int n = k; for (; k < VSET_N; k++) { static const char *const sfx[] = { "", "Gold", "Box", "Dot" }; for (int q = 0; q < 4; q++) { char tn[20]; snprintf(tn, sizeof tn, "Tile%d%s", k, sfx[q]); vu_show(vu_find(row, tn, 0), 0); } }
         vu_text(b, vu_find(row, "Name", 0), vu_name(b, vt_set_key[s]));
         uint64_t cw = vu_find(row, "Count", 0); if (have == n) vu_color(b, cw, 199, 179, 119); else vu_color(b, cw, 191, 191, 191);   // 存齐了金字、整行金框（「存齐的那一行高亮」） | Fully collected: gold text and a gold frame around the whole row ("the fully collected row is highlighted")
@@ -308,7 +313,7 @@ static void vu_search(uint8_t *b, uint64_t vt) {
     uint64_t u = vu_find(vt, "TouchV_Uniq", 0);
     for (int k = 0; k < VPER; k++) { char nm[16]; snprintf(nm, sizeof nm, "TouchV_U%d", k); uint64_t c = vu_find(u, nm, 0); if (!c) continue;
         int j = g_page_q * VPER + k; g_cell_row[k] = j < n ? list[j] : -1; if (j >= n) { vu_show(c, 0); continue; } vu_show(c, 1);
-        const vt_row *r = &vt_rows[list[j]]; int st = vu_state(b, r); vu_tile(b, c, "Tile", r, st); uint64_t nw = vu_find(c, "Name", 0), dm = vu_find(c, "Sub", 0);
+        const vt_row *r = &vt_rows[list[j]]; int st = vu_state(b, r); vu_tile(b, c, "Tile", r, st, k); uint64_t nw = vu_find(c, "Name", 0), dm = vu_find(c, "Sub", 0);
         if (r->kind == 0) vu_color(b, nw, st == ST_NONE ? 60 : 0, st == ST_NONE ? 120 : st == ST_SEEN ? 190 : 252, st == ST_NONE ? 60 : 0);   // 套装件：原版套装绿，没存的压暗 | Set item: the original game's set green, dimmed when not stored
         else if (st == ST_STORED) vu_color(b, nw, 199, 179, 119); else if (st == ST_SEEN) vu_color(b, nw, 170, 160, 130); else vu_color(b, nw, 110, 108, 100);
         if (st == ST_STORED) vu_color(b, dm, 232, 210, 150); else if (st == ST_SEEN) vu_color(b, dm, 150, 190, 255); else vu_color(b, dm, 120, 118, 110);
@@ -377,7 +382,8 @@ void dm_vault_ui_pump(void) {
     vu_move(vt, on ? 0 : 99999, 0);
     if (!on) { if (g_tip_on) { vu_tip(b, vt, NULL); g_tip_on = 0; } was = 0; return; }
 
-    if (!was) { was = 1; atomic_store(&g_dirty, 1); LOG("编年史仓库：进第六页（%s，部位 %d）", g_sub ? "套装" : "暗金", g_part); }
+    static uint64_t owner;
+    if (!was || owner != vt) { was = 1; owner = vt; memset(g_icons, 0, sizeof g_icons); atomic_store(&g_dirty, 1); LOG("编年史仓库：进第六页（%s，部位 %d）", g_sub ? "套装" : "暗金", g_part); }
     // 手柄模式：这一页上没有原版能给焦点的东西，摇杆推着原版光标圈在页上自由走——A = 在光标处点一下，走触屏点按同一条路（dm_ui_touch：格子单击出说明 / 连按两次取出、
     // 部位页签、子页签、勾选、下拉都照旧）；L / R = 上 / 下一页（触屏的翻页箭头手柄版布局里没有）。光标不在编年史页上时 A 照旧归原版（页签条、背包那一侧）
     // Controller mode: nothing on this page can receive the original focus, so the stick moves the original cursor ring freely over the page. A = tap at the

@@ -1742,12 +1742,23 @@ static void mv_prune(void) {   // 不在界面树上的条目直接忘掉（不�
 }
 static int32_t g_mv_base; static int g_mv_base_on;   // 调用方知道这个控件的原位时（如小地图面板贴边 = -宽）在调用前给出：按它算，不拿控件此刻的值当原值（界面重建出来的新控件可能带着我们上一遍挪过的值） | When the caller knows this widget's original position (e.g. the minimap panel flush against the edge = -width), it supplies it before the call: compute from that instead of taking the widget's current value as the original (a new widget produced by a UI rebuild may carry the value we shifted on the previous pass)
 static void mv_offset(int own, uint64_t w, int f, int32_t delta, int relayout) {   // f：0 x、1 y、2 宽 | f: 0 x, 1 y, 2 width
-    if (!w) return; int32_t *v = (int32_t *)(w + 0x70 + 4 * f); int i = 0; while (i < g_nmv && !(g_mv[i].w == w && g_mv[i].f == f)) i++;
+    // 两次布局重建之间不挪原版控件，避免游戏把临时偏移带进下一次重建；切换清理的 delta=0 写回仍要执行。
+    // Do not move original widgets during either rebuild; the next rebuild can inherit that offset. Cleanup restores (delta=0) still run.
+    int dm_padmode_busy(void); if (delta && dm_padmode_busy()) return;
+    if (!w) return;
+    // 物品栏的 +0x10（main+0x3db974）保存当前 x/y 到 +0x18c/+0x190，关闭时原版再从那里回位；它不是重排。
+    // 临时的储藏箱右移 / 魔盒藏背包不能调用它，否则临时位置会变成原位。绘制和命中直接读取当前矩形。
+    // Inventory +0x10 saves the current x/y as the native close position, rather than reflowing the widget.
+    // Keep that baseline intact for temporary stash/cube moves and restores; drawing and hit testing read the live rect.
+    const char *name = (const char *)*(uint64_t *)(w + 8);
+    if (name && !strcmp(name, "PlayerInventoryExpansionLayout")) relayout = 0;
+    int32_t *v = (int32_t *)(w + 0x70 + 4 * f); int i = 0; while (i < g_nmv && !(g_mv[i].w == w && g_mv[i].f == f)) i++;
     if (i == g_nmv) { if (!delta) return; if (!mv_allowed(own, w)) { static int lg; if (lg++ < 8) LOG("【红】位置守卫：%s 要挪的控件「%s」不在名单里，不写", mv_name[own], (const char *)*(uint64_t *)(w + 8)); return; }
         mv_prune();   // 游戏重建界面（如切语言）后旧控件对象没了、新对象另起一条：先把不在界面树上的条目忘掉（不写，内存可能已释放），否则条目越积越多、96 条满了新控件写不进（英文版 ×8 红） | After the game rebuilds the UI (e.g. a language switch) the old widget objects are gone and the new objects start new entries: first forget entries not on the UI tree (no write, the memory may already be freed), otherwise entries keep piling up and once the 96 entries are full new widgets cannot be written (English version: ×8 red)
         if (g_nmv >= 96) { static int lg; if (lg++ < 8) LOG("【红】位置守卫：%s 条目满了（96 条都还挂在界面树上），「%s」不写", mv_name[own], (const char *)*(uint64_t *)(w + 8)); return; }
         if (!mv_count(own)) { static int lg[MV_N]; if (lg[own]++ < 40) LOG("位置守卫：%s 开始挪（%s）", mv_name[own], (const char *)*(uint64_t *)(w + 8)); }   // 每次「开挪」留一条证据（绑定框只挪 0.2 秒，自检碰不上） | Leave one line of evidence at every "start moving" (the binding box is only moved for 0.2 s, which the self-check never catches)
-        g_mv[g_nmv++] = (mvent){ w, own, f, relayout, *v, *v }; }
+        i = g_nmv++;   // mv_prune 会压缩表，必须使用清理后的下标。 | Pruning compacts the table; use the index after pruning.
+        g_mv[i] = (mvent){ w, own, f, relayout, *v, *v }; }
     mvent *e = &g_mv[i]; if (g_mv_base_on) e->orig = g_mv_base; else if (*v != e->val) e->orig = *v;   // 游戏重建 / 重排过：现值当原值（调用方给了原位就用给的） | The game has rebuilt / re-laid out the UI: take the current value as the original value (if the caller supplied an original position, use that)
     if (!delta) { if (*v == e->val && *v != e->orig) { *v = e->orig; if (e->relayout) ((void (*)(uint64_t))*(uint64_t *)(*(uint64_t *)w + 0x10))(w); } g_mv[i] = g_mv[--g_nmv]; return; }
     int32_t want = e->orig + delta; if (*v != want) { *v = want; if (relayout) ((void (*)(uint64_t))*(uint64_t *)(*(uint64_t *)w + 0x10))(w); } e->val = want;
@@ -2083,18 +2094,21 @@ static void ui_pages_pump(module_t *m, uint64_t root) {   // 个人页上把自�
 // While the stash is open: the wide frame moves to -196 (196 out on each side, still centered overall), the old frame is not drawn, the stash panel moves left 196 and widens by 392, the inventory panel moves right 196, and the two title texts and the cursor bounds follow; closing restores it.
 // Rect +0x70 x, +0x78 width; after changing, call vtable +0x10 to re-layout (same as the safe-area portrait move). A value that is not what we last wrote = the panel was rebuilt or the game re-laid it out, so the current value is taken as the original
 static void ui_widestash_pump(uint64_t root) {
-    uint64_t bank = ui_panel(root, "BankExpansionLayout"); int on = bank && *(uint8_t *)(bank + 0x50); static int was = -1; g_mv_want[MV_WIDE] = on;
+    uint64_t bank = ui_panel(root, "BankExpansionLayout"); int on = bank && has_visible_leaf(bank, 1); static int was = -1; g_mv_want[MV_WIDE] = on;
     if (!on && !was && !mv_count(MV_WIDE)) return;   // 关着且已还原：每帧只扫根下一层 | Closed and already restored: only scan one level under the root each frame
-    uint64_t ov = ui_panel(root, "ControllerOverlay"); if (!ov || !ui_find(ov, "WideBackground", 0)) { was = 0; return; }   // 资源里没有宽框：不动 | No wide frame in the assets: leave it alone
+    uint64_t ov = ui_panel(root, "ControllerOverlay");
+    // 外框重建 / 切回不带宽框的布局时，也要清理仍存活的物品栏偏移。
+    // Restore surviving inventory offsets when the overlay is rebuilt or has no wide frame.
+    if (!ov || !ui_find(ov, "WideBackground", 0)) g_mv_want[MV_WIDE] = on = 0;
     if (on != was) { LOG("储藏箱加宽：%s", on ? "开（宽外框、物品栏右移）" : "关（还原）"); was = on; }
     // 标题条 Tabs 两等分，改它的宽不会重分（实测）；直接改它的两个字控件：Text0 原 x 0 宽 1440 → 左半 -196..1636，Text1 原 x 1440 → 右半 1636..3076
     // The title bar Tabs splits in two equal halves, and changing its width does not re-split (measured); change its two text widgets directly: Text0 originally x 0 width 1440 → left half -196..1636, Text1 originally x 1440 → right half 1636..3076
+    if (!on) { mv_restore(root, MV_WIDE); return; }
     uint64_t tb = ui_find(ov, "Tabs", 0);
     // 标题条两端的端帽挂在居中 2880 宽的容器上，各往外挪 196
     // The end caps at both ends of the title bar hang on a centered 2880-wide container; each moves outward by 196
     static const struct { const char *nm; int in, dx, dw; } t[] = { { "WideBackground", 1, -196 - 99999, 0 }, { "Text0", 2, -196, 392 }, { "Text1", 2, 196, 0 },
         { "TabsEndcapLeft", 1, -196, 0 }, { "TabsEndcapRight", 1, 196, 0 }, { "ControllerCursorBounds", 1, -196, 392 }, { "BankExpansionLayout", 0, -196, 392 }, { "PlayerInventoryExpansionLayout", 0, 196, 0 } };
-    if (!on) { mv_restore(root, MV_WIDE); return; }
     for (int i = 0; i < 8; i++) { uint64_t w = t[i].in == 2 ? (tb ? ui_find(tb, t[i].nm, 0) : 0) : t[i].in ? ui_find(ov, t[i].nm, 0) : ui_panel(root, t[i].nm); if (!w) continue;
         float k = t[i].in ? 1.0f : *(float *)(w + 0x80);   // 面板矩形挪 1 单位，画面只挪 1 / 面板缩放（+0x80，iOS 档 1.2）个外框单位：照外框单位写只挪到 5/6（叉偏右 33、面板边对不上框） | Moving the panel rect by 1 unit moves the picture by only 1 / panel scale (+0x80, 1.2 in the iOS mode) outer-frame units: writing in outer-frame units only moves it 5/6 of the way (the X is off to the right by 33 and the panel edge does not line up with the frame)
         mv_offset(MV_WIDE, w, 0, (int)lroundf(t[i].dx * k), 1); mv_offset(MV_WIDE, w, 2, (int)lroundf(t[i].dw * k), 1); }

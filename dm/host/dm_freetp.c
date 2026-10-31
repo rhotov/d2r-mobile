@@ -19,6 +19,12 @@
 //     so during the call skill chain +0x10 (right-click skill) is temporarily pointed at 411 and put back after the call, leaving the right-click skill the player chose unchanged. Target point = at the feet.
 //   - In town (town standing mode 5), when dead, or while casting, the original game refuses the cast (tapping again while casting returns 1 and no second portal appears).
 #include "hle.h"
+#include "../ios/Sources/dm_touch_game_state.h"
+
+/* 原版 HUD 取槽器会考虑「切换武器时分别设置技能按钮」；桌面宿主不链接 iOS HUD 桥。
+   The native HUD getter accounts for Weapon Swap Separate Skill Buttons.
+   The desktop host does not link the iOS HUD bridge. */
+extern int dm_touch_game_snapshot(dm_tg_snapshot *) __attribute__((weak_import));
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -72,7 +78,15 @@ int dm_freetp_zr_free(int zl) { return atomic_load(&g_zr_free[zl != 0]); }
 void dm_freetp_client_step(uint8_t *mb, uint64_t pl) {   // 游戏主线程每帧（dm_actions.c），pl = 客户端玩家；不在局里传 0 | Every frame on the game main thread (dm_actions.c), pl = the client player; pass 0 when not in a run
     if (!mb || !pl) { atomic_store(&g_zr_free[0], 0); atomic_store(&g_zr_free[1], 0); return; }
     grant(mb, pl, 0);
-    int dm_swapskill_wset(void); int bank = dm_swapskill_wset() ? 16 : 0, fr[2] = { 0, 0 }; uint32_t ids[2] = { 0, 0 };
+    dm_tg_snapshot snapshot;
+    uint64_t now = now_ns();
+    if (!dm_touch_game_snapshot || !dm_touch_game_snapshot(&snapshot) ||
+        !snapshot.ready || !snapshot.captured_ns || now < snapshot.captured_ns ||
+        now - snapshot.captured_ns > DM_TG_MAX_AGE_NS ||
+        (snapshot.selected_bank != 0 && snapshot.selected_bank != 16)) {
+        atomic_store(&g_zr_free[0], 0); atomic_store(&g_zr_free[1], 0); return;
+    }
+    int bank = snapshot.selected_bank, fr[2] = { 0, 0 }; uint32_t ids[2] = { 0, 0 };
     for (int i = 0; i < 6; i++) { const uint8_t *e = mb + 0x2d13cbc + 12 * i; uint32_t lg, sl[2]; memcpy(&lg, e, 4); memcpy(sl, e + 4, 8); if (lg != 0x800) continue;
         for (int k = 0; k < 2; k++) if (sl[k] < 12) { memcpy(&ids[k], mb + 0x2d5f0c0 + (uint64_t)(bank + sl[k]) * 28, 4); fr[k] = ids[k] == ZR_EMPTY; } }
     static uint32_t last[2] = { 1, 1 }; if (ids[0] != last[0] || ids[1] != last[1]) { last[0] = ids[0]; last[1] = ids[1]; LOG("免费回城：ZR 这一格绑的技能 %u（按着 ZL：%u）→ %s", ids[0], ids[1], fr[0] ? "空着，ZR 仍当免费回城" : "已绑技能，ZR 交还原版"); }

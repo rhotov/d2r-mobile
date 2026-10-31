@@ -3,12 +3,15 @@ DM_ROOT ?= $(HOME)/dm-work
 # dm/host unit tests in one command: make -C dm/host/tests run (takes seconds; build output goes to build/ and is not committed)
 PY ?= $(DM_ROOT)/build/cache/dm/venv/bin/python
 EXEFS ?= $(DM_ROOT)/data/switch/3.3.94012/Update/ExeFS
+ROMFS ?= $(or $(DM_ROMFS_SRC),$(DM_ROOT)/data/switch/3.3.94012/Update/RomFS)
 B = build
-run: $(B)/t_textbox $(B)/t_padmap $(B)/t_touch $(B)/t_hid_receipt $(B)/t_hid_script $(B)/t_touch_mac $(B)/t_oe $(B)/t_fs $(B)/t_fs_case $(B)/t_romfs_validate $(B)/t_audio $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_movie $(B)/t_condvar $(B)/t_condvar_old $(B)/t_target_rank $(B)/t_hud_dead $(B)/t_namegen $(B)/t_modetx $(B)/t_unit_level $(B)/t_widget $(B)/t_doorspot $(B)/t_cloudsync $(B)/t_i18n $(B)/main.orig.bin $(B)/subsdk0.orig.bin
+run: $(B)/t_bright $(B)/t_freetp $(B)/t_textbox $(B)/t_padmap $(B)/t_touch $(B)/t_hid_receipt $(B)/t_hid_script $(B)/t_touch_mac $(B)/t_oe $(B)/t_fs $(B)/t_fs_case $(B)/t_romfs_validate $(B)/t_audio $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_movie $(B)/t_condvar $(B)/t_condvar_old $(B)/t_target_rank $(B)/t_hud_dead $(B)/t_namegen $(B)/t_modetx $(B)/t_ui_move $(B)/t_legend $(B)/t_vault_icons $(B)/t_unit_level $(B)/t_widget $(B)/t_doorspot $(B)/t_cloudsync $(B)/t_i18n $(B)/main.orig.bin $(B)/subsdk0.orig.bin
 	python3 native_write_scan.py --selftest ..
 	python3 mode_scan.py ../..
 	python3 ../../ios/tools/dm_i18n.py --check
 	python3 ../../i18n/scan_literals.py
+	$(B)/t_bright
+	$(B)/t_freetp
 	$(B)/t_textbox
 	$(B)/t_touch
 	$(B)/t_hid_script 2>/dev/null
@@ -29,6 +32,9 @@ run: $(B)/t_textbox $(B)/t_padmap $(B)/t_touch $(B)/t_hid_receipt $(B)/t_hid_scr
 	$(B)/t_hud_dead
 	$(B)/t_namegen
 	$(B)/t_modetx
+	$(B)/t_ui_move
+	$(B)/t_legend
+	$(B)/t_vault_icons
 	$(B)/t_padmap
 	$(B)/t_unit_level
 	$(B)/t_widget
@@ -53,6 +59,16 @@ $(B)/t_padmap: t_padmap.c ../dm_padmap.h ../dm_input.h | $(B)
 	clang -O1 -Wall -Werror -o $@ t_padmap.c
 $(B)/t_modetx: t_modetx.c ../dm_modetx.h | $(B)
 	clang -O1 -Wall -Werror -o $@ t_modetx.c
+$(B)/t_ui_move: t_ui_move.c ../dm_cursor.c $(wildcard ../*.h) | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -Wl,-dead_strip -o $@ t_ui_move.c
+$(B)/t_legend: t_legend.c ../dm_padmode.c $(wildcard ../*.h) | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -Wl,-dead_strip -o $@ t_legend.c
+$(B)/t_vault_icons: t_vault_icons.c ../dm_vault_ui.c ../dm_vault_tab.h $(wildcard ../*.h) | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -Wl,-dead_strip -o $@ t_vault_icons.c
+# 新检出尚无仓库表头时，复用宿主生成规则，只读玩家本机的游戏文件，生成物不入库。
+# On a fresh checkout, reuse the host generator with the player's local game files; generated output stays untracked.
+../dm_vault_tab.h: ../../ios/tools/gen_vault_table.py
+	$(MAKE) -C .. dm_vault_tab.h DM_ROOT="$(DM_ROOT)" ROMFS="$(ROMFS)"
 $(B)/t_namegen: t_namegen.c ../dm_namegen.c | $(B)
 	clang -O1 -Wall -Werror -o $@ t_namegen.c ../dm_namegen.c
 $(B)/t_cloudsync: t_cloudsync.c ../dm_cloudsync.c ../dm.h | $(B)
@@ -102,3 +118,9 @@ $(B)/t_touch_mac: t_touch_mac.c ../touch_mac.c ../dm_cursor.c ../dm_hud.c ../dm_
 	clang -std=c11 -Wall -Wextra -Werror -I.. -I../../ios/Sources -o $@ t_touch_mac.c ../dm_cursor.c ../dm_hud.c -lm
 $(B)/t_target_rank: t_target_rank.c ../hle_target.c ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_target_rank.c ../hle_target.c
+
+$(B)/t_freetp: t_freetp.c ../dm_freetp.c ../../ios/Sources/dm_touch_game_state.h | $(B)
+	clang -O1 -Wall -Werror -Wno-unused-function -Wl,-dead_strip -o $@ t_freetp.c
+
+$(B)/t_bright: t_bright.c ../dm_bright.c ../dm.h ../dm_hud.h | $(B)
+	clang -O1 -Wall -Werror -I.. -o $@ t_bright.c ../dm_bright.c
