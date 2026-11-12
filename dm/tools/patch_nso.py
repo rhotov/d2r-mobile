@@ -947,6 +947,70 @@ for oa, wa, ob_, wb, r, key, why in params:
     emit(STR_PRE(tmp, 31, -16) if NOREDZONE else STUR(tmp, 31, -16)); emit_tp(r); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDR_POST(tmp, 31, 16) if NOREDZONE else LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
     struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
 
+if BUILD_ID == 'db0507f36b84200ac05f75d76ed5026f':
+    def transition_cut(off, old, start, why):
+        assert struct.unpack_from('<I', IMG, off)[0] == old, f'换图防崩剪口原字节不符 {off:#x}'
+        new = B(off, start)
+        struct.pack_into('<I', IMG, off, new)
+        cuts.append((off, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), why, '仅宿主'))
+
+    # 两条释放路径共享同一张分页资源表。缺页按原有的空条目分支继续。
+    # Both release paths use the same paged resource table. Reuse the empty-entry path for missing pages.
+    for off, entry_reg, missing in ((0x1328bb4, 12, 0x1328b6c), (0x1328c88, 10, 0x1328c40)):
+        start = here()
+        emit(0x53097d0a)  # 页号 | page number: lsr w10, w8, #9
+        emit(0xb941b26c)  # 页数 | page count: ldr w12, [x19, #0x1b0]
+        emit(0x6b0c015f)  # cmp w10, w12
+        emit(0x54000102)  # 页号或索引越界 | out of range: b.hs missing
+        emit(LDRX(11, 19, 0x1a0 // 8))
+        emit(0xb40000cb)  # 无表 | missing table: cbz x11, missing
+        emit(0xf86a796a)  # 表页 | table page: ldr x10, [x11, x10, lsl #3]
+        emit(0xb400008a)  # 无页 | missing page: cbz x10, missing
+        emit(0x9240210b)  # 槽号 | slot number: and x11, x8, #0x1ff
+        emit(0xf86b7940 | entry_reg)  # ldr xEntry, [x10, x11, lsl #3]
+        emit(B(here(), off + 24))  # 原有的空槽检查 | original slot check
+        emit(B(here(), missing))
+        transition_cut(off, 0xf940d26b, start, '释放资源引用：缺失的表或页按空条目处理')
+
+    # 第一条路径更新第二个计数前会重读槽。若槽已经清空或换成别的对象，跳过第二次更新。
+    # The first path reloads the slot before updating the second count. Skip it if the slot no longer refers to the same object.
+    start = here()
+    emit(0xf86b794a)  # ldr x10, [x10, x11, lsl #3]
+    emit(0x9102314d)  # add x13, x10, #0x8c
+    emit(0xeb0c01bf)  # 比对第一个计数器地址 | compare first counter address: cmp x13, x12
+    emit(0x54000041)  # 槽变了 | slot changed: b.ne missing
+    emit(B(here(), 0x1328bec))
+    emit(B(here(), 0x1328b6c))
+    transition_cut(0x1328be8, 0xf86b794a, start, '释放资源引用：重读时条目已清除或更换则跳过')
+
+    # effect.isRunning 的字节数组在 +0x48，+0x50 是元素数（见 0x12d35d0–0x12d3648）。
+    # effect.isRunning stores its byte array at +0x48 and its element count at +0x50 (see 0x12d35d0–0x12d3648).
+    start = here()
+    emit(0xb4000068)  # 无上下文 | missing context: cbz x8
+    emit(LDP(8, 14, 8, 0x48))  # x8 为数组、w14 为元素数 | x8 = array, w14 = count
+    emit(B(here(), 0x144f17c))
+    emit(0x2a1f03ee)  # 无上下文：w14 清零，x8 已为空 | missing context: w14 = 0, x8 already zero
+    emit(B(here(), 0x144f17c))
+    transition_cut(0x144f178, 0xf9402508, start, 'effect.isRunning：加载字节数组和元素数')
+
+    # 常量、单项尾数及展开循环的两次读取各核对自己的索引，缺失时沿用原符号位提取，输出 false。
+    # Check the index at the constant, odd-item, and two unrolled reads. A missing entry supplies zero to the original sign-bit extraction.
+    for off, old, index, result in (
+        (0x144f184, 0x38e96908, 9, 8),
+        (0x144f274, 0x38ed690d, 13, 13),
+        (0x144f28c, 0x38ec690c, 12, 12),
+        (0x144f2a0, 0x38ec690c, 12, 12),
+    ):
+        start = here()
+        emit(0x6b0e001f | (index << 5))  # cmp wIndex, w14
+        emit(0x54000082)  # 页号或索引越界 | out of range: b.hs missing
+        emit(0xb4000068)  # 无数组 | missing array: cbz x8
+        emit(old)
+        emit(B(here(), off + 4))
+        emit(0x2a1f03e0 | result)  # 无条目：输出零 | missing entry: mov wResult, wzr
+        emit(B(here(), off + 4))
+        transition_cut(off, old, start, 'effect.isRunning：索引越界或数组缺失时输出 false')
+
 # 既有三块原生规则跳板均只使用后继覆盖的死临时w8，不改w0/stat返回、sp或NZCV。
 # 6c6290位于原mode3门后；前方Blaze/引用计数与数据失效6c62dc分支、后方状态更新不动。
 # The three existing native rule trampolines all use only the dead temporary w8 that is overwritten afterwards, and do not change the w0/stat return, sp or NZCV.
